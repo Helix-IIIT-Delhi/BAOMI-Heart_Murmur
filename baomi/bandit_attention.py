@@ -30,29 +30,41 @@ class BanditCrossAttention(nn.Module):
     def forward(self, codec_feat, spectral_feat):
         """Multi-head cross-attention with bandit head selection"""
         batch_size = codec_feat.size(0)
+        seq_len = codec_feat.size(1)
 
-        Q = self.query(codec_feat).view(batch_size, -1, self.num_heads, self.head_dim)
-        K = self.key(spectral_feat).view(batch_size, -1, self.num_heads, self.head_dim)
-        V = self.value(spectral_feat).view(batch_size, -1, self.num_heads, self.head_dim)
+        # Project and reshape for multi-head attention
+        Q = self.query(codec_feat).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        K = self.key(spectral_feat).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        V = self.value(spectral_feat).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
 
-        # Compute attention per head
+        # Transpose to [batch, num_heads, seq_len, head_dim] for proper attention
+        Q = Q.permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
+        K = K.permute(0, 2, 1, 3)
+        V = V.permute(0, 2, 1, 3)
+
+        # Compute scaled dot-product attention per head
         attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
         attention_weights = F.softmax(attention_scores, dim=-1)
 
-        # Compute rewards (mean attention weight per head as reward signal)
-        rewards = attention_weights.mean(dim=(0, 1, 2))
+        # Apply attention to values
+        attended = torch.matmul(attention_weights, V)  # [batch, num_heads, seq_len, head_dim]
+
+        # Compute rewards as mean attention weight per head
+        rewards = attention_weights.mean(dim=(2, 3))  # [batch, num_heads]
+        rewards = rewards.mean(dim=0)  # [num_heads]
 
         # Update Q-values with bandit algorithm
         new_q = self.q_values * self.decay + rewards * (1 - self.decay)
         self.q_values.data = new_q
 
-        # Get best heads and apply weighted combination
-        head_weights = F.softmax(self.q_values, dim=0)
+        # Get head weights based on Q-values
+        head_weights = F.softmax(self.q_values, dim=0)  # [num_heads]
 
-        # Apply attention to values
-        attended = torch.matmul(attention_weights, V)  # [batch, seq, num_heads, head_dim]
+        # Weighted combination of heads: [batch, num_heads, seq_len, head_dim]
+        weighted_attended = attended * head_weights.view(1, -1, 1, 1)
+        output = weighted_attended.sum(dim=1)  # [batch, seq_len, head_dim]
 
-        # Weighted combination of heads
-        output = (attended * head_weights.view(1, 1, -1, 1)).sum(dim=2)
+        # Reshape back to [batch, seq_len, d_model]
+        output = output.reshape(batch_size, seq_len, self.d_model)
 
         return self.output(output)
